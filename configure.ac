@@ -1,4 +1,4 @@
-AC_INIT([upon], [0.0.1], [fnordomat])
+AC_INIT([upon], [0.0.2], [fnordomat])
 
 AM_INIT_AUTOMAKE([subdir-objects])
 

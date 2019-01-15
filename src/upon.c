@@ -1,5 +1,5 @@
 /**
- * upon(TM) for Linux(TM) version 0.0.1
+ * upon(TM) for Linux(TM) version 0.0.2
  *
  * fnordomat <GPG:46D46D1246803312401472B5A7427E237B7908CA>
  *
@@ -343,10 +343,35 @@ void handle_msg(struct cn_msg *cn_hdr) {
                             // from consideration, to eschew infinite loops.
                         }
                         else {
-                            char *const args[] = {executable, (char*)NULL};
+                            // Barbaric approximation to argument parsing, which does not respect quotes
+                            char **args = malloc(sizeof(char*) * 1);
 
-                            if (execve(executable, args, NULL) == -1) {
-                                fprintf(stderr, "Error %s executing %s\n", strerror(errno), executable);
+                            size_t i=0;
+                            char *p1 = action[c]+4, *p2 = action[c]+4;
+                            args[0] = p1;
+
+                            for (; ; ) {
+
+                                fprintf(stderr, "%s %s %lu\n", p1, p2, i);
+
+                                if ((*p2 == ' ') || (*p2 == '\0')) {
+                                    args = realloc(args, sizeof(char*) * (i+2));
+                                    args[i] = p1;
+                                    fprintf(stderr, "arg %lu: %s\n", i, args[i]);
+
+                                    if (*p2 == '\0') break;
+                                    *p2 = '\0';
+                                    p1 = p2+1;
+                                    i++;
+                                }
+
+                                p2++;
+                            }
+
+                            args[i+1] = NULL;
+
+                            if (execve(args[0], args, NULL) == -1) {
+                                fprintf(stderr, "Error %s executing \"%s\"\n", strerror(errno), executable);
                                 exit(EXIT_FAILURE);
                             }
                         }
@@ -601,7 +626,7 @@ void printUsage()
     fprintf(stderr, "Usage: upon [-v] -- tuple1 ...\n");
     fprintf(stderr, "-v : increase verbosity (up to -vvv = DEBUG)\n");
     fprintf(stderr, "tuple:     eventtype match action\n");
-    fprintf(stderr, "eventtype: exec\n");
+    fprintf(stderr, "eventtype: exec / exit\n");
     fprintf(stderr, "match:     p(pid) or m(initial part of process cmdline to filter)\n");
     fprintf(stderr, "action:    sigstop / run [executable]\n");
 }
@@ -611,12 +636,8 @@ int main(int argc, char ** argv, char ** envp) {
     atexit((void(*)(void))close_socket);
     atexit(free_capabilities);
 
-    // Normally, processes will be filtered by original uid, gid.
-
     original_uid = getuid();
     original_gid = getgid();
-    
-    fprintf(stderr, "uid %d, euid %d\n", getuid(), geteuid());
 
     // Was it perhaps run via sudo? Attempt to find original uid, gid from environment set by sudo.
 
