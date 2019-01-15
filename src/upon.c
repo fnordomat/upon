@@ -75,14 +75,21 @@
  * Foundation, Inc., 59 Temple Place, Suite 330, Boston, MA 02111-1307 USA
  */
 
+// Support being run setuid root
+#define ALLOW_ROOT 0
+// Use POSIX capabilities (ALLOW_ROOT=0 recommended)
+#define USE_CAPS 1
+// Not recommended, but convenient: use command processor, not execve
+#define ALLOW_SYSTEM 1
+
 #include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <signal.h>
 #include <sysexits.h>
+#include <unistd.h>
 
 #include <sys/capability.h>
 #include <sys/socket.h>
@@ -112,11 +119,6 @@
 #define ANSI_COLOR_CYAN    "\x1b[36m"
 #define ANSI_COLOR_RESET   "\x1b[0m"
 
-// Support being run setuid root
-#define ALLOW_ROOT 0
-// Use POSIX capabilities (ALLOW_ROOT=0 recommended)
-#define USE_CAPS   1
-
 extern int errno;
 
 static __uid_t original_uid;
@@ -130,7 +132,13 @@ static int verbosity = 0;
 
 static int sk_nl;
 
+#if USE_CAPS == 1
 static cap_t capabilities = NULL;
+#endif
+
+#if ALLOW_SYSTEM == 1
+static int use_system = 0;
+#endif
 
 static int close_socket() {
     if (sk_nl != -1) {
@@ -139,20 +147,24 @@ static int close_socket() {
     return 0;
 }
 
+#if USE_CAPS == 1
 static void free_capabilities() {
     if (capabilities != NULL) {
         (void)cap_free(capabilities);
     }
 }
+#endif
 
 static void signal_handler(const int sig) {
     switch(sig){
-        case SIGINT:
-        case SIGTERM:
-        case SIGQUIT:
-            close_socket();
-            free_capabilities();
-            exit(EXIT_SUCCESS);
+    case SIGINT:
+    case SIGTERM:
+    case SIGQUIT:
+        close_socket();
+#if USE_CAPS == 1
+        free_capabilities();
+#endif
+        exit(EXIT_SUCCESS);
     }
 }
 
@@ -236,14 +248,13 @@ void ignorePid(pid_t pid) {
 void handle_msg(struct cn_msg *cn_hdr) {
     // apparently limited to PAGE_SIZE, which is 4096:
     char cmdline[4096];
-    char fname_status[PATH_MAX], fname_cmdline[PATH_MAX];
+    char fname_cmdline[PATH_MAX];
 
     int fd, i;
     ssize_t r=0;
 
     struct proc_event* ev = (struct proc_event*)cn_hdr->data;
 
-    snprintf(fname_status,  sizeof(fname_status),  "/proc/%d/status",  ev->event_data.exec.process_pid);
     snprintf(fname_cmdline, sizeof(fname_cmdline), "/proc/%d/cmdline", ev->event_data.exec.process_pid);
 
     fd = open(fname_cmdline, O_RDONLY);
@@ -280,8 +291,8 @@ void handle_msg(struct cn_msg *cn_hdr) {
     else if (PROC_EVENT_FORK == ev->what) {
         if (verbosity >= 2) {
             printf(ANSI_COLOR_CYAN "FORK: parent=%d child=%d [%s]" ANSI_COLOR_RESET "\n",
-               ev->event_data.fork.parent_pid,
-               ev->event_data.fork.child_pid, cmdline);
+                   ev->event_data.fork.parent_pid,
+                   ev->event_data.fork.child_pid, cmdline);
         }
         if (isIgnored(ev->event_data.fork.parent_pid)) {
             ignorePid(ev->event_data.fork.child_pid);
@@ -293,35 +304,38 @@ void handle_msg(struct cn_msg *cn_hdr) {
         if (eventType[c] == ev->what) {
 
             int match = 0;
-            if (target[c] != NULL) { match = (cmdline == strstr(cmdline, target[c])); }
-            else {
-                int test_pid = 0;
-                switch (ev->what) {
-                case PROC_EVENT_EXEC:
-                    test_pid = ev->event_data.exec.process_pid;
-                    break;
-                case PROC_EVENT_EXIT:
-                    test_pid = ev->event_data.exit.process_pid;
-                    break;
-                case PROC_EVENT_FORK:
-                    test_pid = ev->event_data.fork.child_pid;
-                    break;
-                default:
-                    fprintf(stderr, "Warning: test for pid not yet implemented for event type %x\n", ev->what);
-                    return;
-                }
-                match = (target_pid[c] == test_pid);
+            int process_pid = 0;
+            switch (ev->what) {
+            case PROC_EVENT_EXEC:
+                process_pid = ev->event_data.exec.process_pid;
+                break;
+            case PROC_EVENT_EXIT:
+                process_pid = ev->event_data.exit.process_pid;
+                break;
+            case PROC_EVENT_FORK:
+                process_pid = ev->event_data.fork.child_pid;
+                break;
+            default:
+                fprintf(stderr, "Warning: test for pid not yet implemented for event type %x\n", ev->what);
+                return;
             }
+            if (target[c] != NULL) {
+                match = (cmdline == strstr(cmdline, target[c]));
+            }
+            else {
+                match = (target_pid[c] == process_pid);
+            }
+
             if (match) {
                 if (NULL != strstr(action[c], "sigstop")) {
                     if (verbosity > 0) {
-                        printf(ANSI_COLOR_YELLOW "Match -- stopping process." ANSI_COLOR_RESET "\n");
+                        printf(ANSI_COLOR_YELLOW "Match process %d [%s] -- stopping process." ANSI_COLOR_RESET "\n", process_pid, cmdline);
                     }
                     kill(ev->event_data.exec.process_pid, SIGSTOP);
                 }
                 else if (NULL != strstr(action[c], "run ")) {
                     if (verbosity > 0) {
-                        printf(ANSI_COLOR_YELLOW "Match -- executing command." ANSI_COLOR_RESET "\n");
+                        printf(ANSI_COLOR_YELLOW "Match process %d [%s] -- executing command." ANSI_COLOR_RESET "\n", process_pid, cmdline);
                     }
 
                     if (strlen(action[c]) > 4)
@@ -343,8 +357,18 @@ void handle_msg(struct cn_msg *cn_hdr) {
                             // from consideration, to eschew infinite loops.
                         }
                         else {
+#if ALLOW_SYSTEM == 1
+                            if (use_system == 1) {
+                                if (system(executable) == -1) {
+                                    fprintf(stderr, "Error %s executing \"%s\"", strerror(errno), executable);
+                                    exit(EXIT_FAILURE);
+                                }
+                                exit(EXIT_SUCCESS);
+                            }
+#endif
+
                             // Barbaric approximation to argument parsing, which does not respect quotes
-                            char **args = malloc(sizeof(char*) * 1);
+                            char **args = (char**)malloc(sizeof(char*) * 1);
 
                             size_t i=0;
                             char *p1 = action[c]+4, *p2 = action[c]+4;
@@ -352,14 +376,13 @@ void handle_msg(struct cn_msg *cn_hdr) {
 
                             for (; ; ) {
 
-                                fprintf(stderr, "%s %s %lu\n", p1, p2, i);
-
                                 if ((*p2 == ' ') || (*p2 == '\0')) {
                                     args = realloc(args, sizeof(char*) * (i+2));
                                     args[i] = p1;
-                                    fprintf(stderr, "arg %lu: %s\n", i, args[i]);
 
-                                    if (*p2 == '\0') break;
+                                    if (*p2 == '\0') {
+                                        break;
+                                    }
                                     *p2 = '\0';
                                     p1 = p2+1;
                                     i++;
@@ -501,9 +524,8 @@ static void drop_privileges() {
         exit(-1);
     }
 
-    if (setuid(0) == 0 || seteuid(0) == 0) {
-        fprintf(stderr, "Error: unsuccessful dropping root privileges.\n");
-        return -1;
+    if (original_uid != 0 && (setuid(0) == 0 || seteuid(0) == 0)) {
+        fprintf(stderr, "Warning: unsuccessful dropping root privileges.\n");
     }
 #endif
 }
@@ -516,8 +538,8 @@ int runMain() {
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = SA_RESTART;
     if (   (sigaction(SIGINT,  &sa, NULL) == -1) \
-        || (sigaction(SIGTERM, &sa, NULL) == -1) \
-        || (sigaction(SIGQUIT, &sa, NULL) == -1) ) {
+           || (sigaction(SIGTERM, &sa, NULL) == -1) \
+           || (sigaction(SIGQUIT, &sa, NULL) == -1) ) {
         fprintf(stderr, "Cannot install signal handler: %s", strerror(errno));
         exit(EXIT_FAILURE);
     }
@@ -597,7 +619,7 @@ int runMain() {
     // main loop
 
     for (memset(buffer, 0, sizeof(buffer)), from_nla_len = sizeof(from_nla);
-       ; memset(buffer, 0, sizeof(buffer)), from_nla_len = sizeof(from_nla)) {
+         ; memset(buffer, 0, sizeof(buffer)), from_nla_len = sizeof(from_nla)) {
         struct nlmsghdr *nlh = (struct nlmsghdr*)buffer;
         memcpy(&from_nla, &kern_nla, sizeof(from_nla));
         recv_len = recvfrom(sk_nl, buffer, BUFF_SIZE, 0,
@@ -623,8 +645,15 @@ int runMain() {
 
 void printUsage()
 {
-    fprintf(stderr, "Usage: upon [-v] -- tuple1 ...\n");
+    fprintf(stderr, "Usage: upon [-v] "
+        #if ALLOW_SYSTEM == 1
+                    "[-s] "
+        #endif
+                    "-- tuple1 ...\n");
     fprintf(stderr, "-v : increase verbosity (up to -vvv = DEBUG)\n");
+#if ALLOW_SYSTEM == 1
+    fprintf(stderr, "-s : use system instead of execve\n");
+#endif
     fprintf(stderr, "tuple:     eventtype match action\n");
     fprintf(stderr, "eventtype: exec / exit\n");
     fprintf(stderr, "match:     p(pid) or m(initial part of process cmdline to filter)\n");
@@ -634,7 +663,9 @@ void printUsage()
 int main(int argc, char ** argv, char ** envp) {
 
     atexit((void(*)(void))close_socket);
+#if USE_CAPS == 1
     atexit(free_capabilities);
+#endif
 
     original_uid = getuid();
     original_gid = getgid();
@@ -643,7 +674,7 @@ int main(int argc, char ** argv, char ** envp) {
 
     if (original_uid == 0) {
 
-        for (char **env = envp; *env != 0; env++)
+        for (char **env = envp; *env != NULL; env++)
         {
             char *thisEnv = *env;
             if (strstr(thisEnv, "SUDO_UID=") == thisEnv) {
@@ -688,9 +719,19 @@ int main(int argc, char ** argv, char ** envp) {
 
     int c;
     opterr = 0;
-    while ((c = getopt (argc, argv, "v")) != -1) {
+    while ((c = getopt (argc, argv,
+                    #if ALLOW_SYSTEM == 1
+                        "s"
+                    #endif
+                        "v"
+                        )) != -1) {
         switch (c)
         {
+#if ALLOW_SYSTEM == 1
+        case 's':
+            use_system = 1;
+            break;
+#endif
         case 'v':
             verbosity ++;
             break;
@@ -732,22 +773,20 @@ int main(int argc, char ** argv, char ** envp) {
         if (strlen(tgt) < 1 || !((tgt[0] == 'p') || (tgt[0] == 'm'))) {
             fprintf(stderr, "Invalid argument, %s.\n", tgt);
             return -1;
-        } else {
-            if (tgt[0] == 'p') {
-                if (!sscanf(tgt, "p%d", &target_pid[c])) {
-                    fprintf(stderr, "Not a valid integer, %s.\n", tgt+1);
-                    return -1;
-                }
-                target[c] = NULL;
-            } else if (tgt[0] == 'm') {
-                if (eventType[c] != PROC_EVENT_EXEC) {
-                    fprintf(stderr, "Combination of event type %x and %c not supported at the moment.\n", eventType[c], tgt[0]);
-                    return -1;
-                }
-                target[c] = tgt + 1;
-            } else {
-                // unreachable
+        }if (tgt[0] == 'p') {
+            if (!sscanf(tgt, "p%d", &target_pid[c])) {
+                fprintf(stderr, "Not a valid integer, %s.\n", tgt+1);
+                return -1;
             }
+            target[c] = NULL;
+        } else if (tgt[0] == 'm') {
+            if (eventType[c] != PROC_EVENT_EXEC) {
+                fprintf(stderr, "Combination of event type %x and %c not supported at the moment.\n", eventType[c], tgt[0]);
+                return -1;
+            }
+            target[c] = tgt + 1;
+        } else {
+            // unreachable
         }
         action[c] = argv[3*c + optind + 2];
     }
