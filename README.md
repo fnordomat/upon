@@ -8,6 +8,15 @@ Start one process when another (specified by PID) quits, or perform an action wh
 
 Linux with CONFIG_CONNECTOR=y CONFIG_PROC_EVENTS=y configured.
 
+## Build
+
+```
+touch config.rpath
+autoreconf -iv
+./configure --prefix=/usr/local
+make
+```
+
 ## Usage
 
 ```
